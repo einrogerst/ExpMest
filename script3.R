@@ -13,7 +13,6 @@ registerDoParallel(cl)
 library(tm)
 library(slam)
 
-setwd("C:/Users/i826950/Desktop/Personal/panglee")
 options(stringsAsFactors = FALSE)
 set.seed(7)
 
