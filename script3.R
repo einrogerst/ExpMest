@@ -151,37 +151,52 @@ basicControl <- list(removePunctuation = TRUE,
                   stopwords = myStopwordsList,
                   wordLengths = c(3, Inf))
 
+cl <- makeCluster(logical.cores)
+registerDoParallel(cl) 
+
 system.time(corpusFolds <- 
   foreach(i = 1:numFolds, .combine=c, .packages=c("tm", "slam")) %dopar% 
   getTrainTestCorpus(dirSrcFolds, dirSrc, i, basicControl, myStopwordsList))
 
 ################ END OF PREPROCESSING ########################
 
-i=1
 library(Matrix)
 library(xgboost)
-train <- 
-  xgb.DMatrix(
-    sparseMatrix(i=corpusFolds[[i]]$train$i, 
-                 j=corpusFolds[[i]]$train$j, 
-                 x=corpusFolds[[i]]$train$v, 
-                 dims=c(corpusFolds[[i]]$train$nrow, corpusFolds[[i]]$train$ncol), 
-                 dimnames = corpusFolds[[i]]$train$dimnames),
-    label=as.numeric(corpusFolds[[i]]$train$docsentclass=="pos"))
+# i=1
+# train <- 
+#   xgb.DMatrix(
+#     sparseMatrix(i=corpusFolds[[i]]$train$i, 
+#                  j=corpusFolds[[i]]$train$j, 
+#                  x=corpusFolds[[i]]$train$v, 
+#                  dims=c(corpusFolds[[i]]$train$nrow, corpusFolds[[i]]$train$ncol), 
+#                  dimnames = corpusFolds[[i]]$train$dimnames),
+#     label=as.numeric(corpusFolds[[i]]$train$docsentclass=="pos"))
 
-xg1 <- xgb.train(params=list(booster="gbtree", 
-                             max_depth=6,
-                             objective="binary:logistic",
-                             subsample=1,
-                             eta=0.01),
-                 data=train, 
-                 nrounds=500,
-                 verbose = 2,
-                 nthread = 2,
-                 eval_metric="error")
+system.time(
+train <- lapply(corpusFolds, function(corpusFold) 
+   tr <- xgb.DMatrix(
+    sparseMatrix(i=corpusFold$train$i,
+                 j=corpusFold$train$j,
+                 x=corpusFold$train$v,
+                 dims=c(corpusFold$train$nrow, corpusFold$train$ncol),
+                 dimnames = corpusFold$train$dimnames),
+    label=as.numeric(corpusFold$train$docsentclass=="pos")))
+)
 
-xg_simple <- xgboost(data=train, nrounds=1000, eta=0.01, max_depth=3)
-print(xg_simple)
+system.time(
+  test <- lapply(corpusFolds, function(corpusFold) 
+    tr <- xgb.DMatrix(
+      sparseMatrix(i=corpusFold$test$i,
+                   j=corpusFold$test$j,
+                   x=corpusFold$test$v,
+                   dims=c(corpusFold$test$nrow, corpusFold$test$ncol),
+                   dimnames = corpusFold$test$dimnames),
+      label=as.numeric(corpusFold$test$docsentclass=="pos")))
+)
+
+#
+# xg_simple <- xgboost(data=train, nrounds=1000, eta=0.01, max_depth=3)
+#
 # xgrf <- xgb.train(params=list(booster="gbtree", 
 #                              max_depth=Inf,
 #                              objective="binary:logistic",
@@ -196,14 +211,6 @@ print(xg_simple)
 #                  nthread = 2,
 #                  eval_metric="error")
 
-test <- 
-  xgb.DMatrix(
-    sparseMatrix(i=corpusFolds[[i]]$test$i, 
-                 j=corpusFolds[[i]]$test$j, 
-                 x=corpusFolds[[i]]$test$v, 
-                 dims=c(corpusFolds[[i]]$test$nrow, corpusFolds[[i]]$test$ncol), 
-                 dimnames = corpusFolds[[i]]$test$dimnames),
-    label=as.numeric(corpusFolds[[i]]$test$docsentclass=="pos"))
 
 sum(as.numeric(corpusFolds[[i]]$train$docsentclass=="pos")==as.numeric(predict(xg_simple, train)>0.5))/nrow(corpusFolds[[i]]$train)
 
@@ -212,9 +219,9 @@ sum(as.numeric(corpusFolds[[i]]$test$docsentclass=="pos")==as.numeric(predict(xg
 hist(predict(xg1, test))
 hist(predict(xg1, train))
 
-accXGboost <- function(trainData, testData, testLabels, pNrounds, pEta, pMax_depth, pSubsample)
+logDF <- data.frame()
+accXGboost <- function(trainData, testData, testLabels, pNrounds, pEta, pMax_depth, pSubsample, pFold)
 {
-  print(paste0("Rounds: ", floor(pNrounds), ", Eta: ", pEta, ", Subsample: ", pSubsample, ", Max Depth: ", floor(pMax_depth)))
   myModel <- 
     xgb.train(params = list(booster = "gbtree",
                             eta=pEta, 
@@ -224,7 +231,21 @@ accXGboost <- function(trainData, testData, testLabels, pNrounds, pEta, pMax_dep
               data=trainData, 
               nrounds=floor(pNrounds), 
               verbose = 0)
-  sum(testLabels==as.numeric(predict(myModel, testData)>0.5))/length(testLabels)
+  result <- sum(testLabels==as.numeric(predict(myModel, testData)>0.5))/length(testLabels)
+  print(paste0("Fold: ", pFold,
+               ", Rounds: ", floor(pNrounds),
+               ", Eta: ", pEta,
+               ", Subsample: ", pSubsample,
+               ", Max Depth: ", floor(pMax_depth),
+               ", Accuracy: ", result))
+  logDF <<- rbind(logDF, 
+                  data.frame(Fold=pFold, 
+                             Rounds = floor(pNrounds), 
+                             Eta = pEta,
+                             Subsample = pSubsample,
+                             MaxDepth = floor(pMax_depth),
+                             Accuracy = result))
+  result
 }
 
 # accXGboost(trainData = train,
@@ -235,20 +256,38 @@ accXGboost <- function(trainData, testData, testLabels, pNrounds, pEta, pMax_dep
 #            pMax_depth = 3)
 
 library(GA)
+
 GA <- ga(type = "real-valued", 
-         fitness = function(x) accXGboost(trainData = train,
-                                          testData = test,
-                                          testLabels=as.numeric(corpusFolds[[i]]$test$docsentclass=="pos"),
-                                          pNrounds=x[1],
-                                          pEta=x[2],
-                                          pMax_depth=x[3], 
-                                          pSubsample=x[4]),
-         names = c("pNrounds", "pEta", "pMax_depth", "pSubsample"),
-         min = c(1, 0.0001, 1, 0.1), 
-         max = c(100, 1, 30, 1),
-         popSize = 50, 
+         fitness = function(x) accXGboost(trainData = train[[floor(x[1])]],
+                                          testData = test[[floor(x[1])]],
+                                          testLabels=as.numeric(corpusFolds[[floor(x[1])]]$test$docsentclass=="pos"),
+                                          pNrounds=x[2],
+                                          pEta=x[3],
+                                          pMax_depth=x[4], 
+                                          pSubsample=x[5],
+                                          pFold=floor(x[1])),
+         names = c("Fold", "Rounds", "Eta", "Max_depth", "Subsample"),
+         min = c(    1,   1, 0.0001,  1, 0.1), 
+         max = c(10.99, 100,      1, 30,   1),
+         popSize = 60, 
          maxiter = 30)
+
+save(logDF, file = "logGA.RData")
+save(GA, file = "GA.RData")
 
 summary(GA)
 GA@summary
-summary(lm(X4~., data=data.frame(cbind(GA@population, GA@fitness))))
+summary(lm(X6~., data=data.frame(cbind(GA@population, GA@fitness))))
+
+summary(logDF[logDF$Accuracy>0.85,-1])
+
+library(reshape2)
+str(logDF)
+graphData <- melt(logDF, id.vars = "Accuracy")
+graphData <- graphData[graphData$variable!="Fold",]
+ggplot(data=graphData, mapping=aes(x=Accuracy, y=value)) + 
+  geom_bin2d(bins=25) +
+  #geom_jitter(shape=1) + 
+  facet_wrap( ~ variable, ncol=2, scales="free_y") + scale_colour_gradient(trans = "log")
+
+
